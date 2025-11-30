@@ -1,0 +1,6 @@
+opencv-python>=4.5.0
+onnxruntime>=1.12.0
+numpy>=1.21.0
+# Опционально: для использования NCNN моделей (быстрее на Raspberry Pi)
+# pip install pyncnn  # или соберите из исходников
+
