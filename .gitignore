@@ -54,3 +54,6 @@ Thumbs.db
 *.bak
 *.cache
 
+# GitHub token (локальный файл, не коммитить!)
+.github_token
+
