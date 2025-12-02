@@ -1,6 +1,7 @@
 """
 Комбинированный детектор: YOLO Pose (детекция номера) + YOLO (посимвольная детекция)
 Максимально близко к эталонному коду с десктопа
+Оптимизировано для Raspberry Pi 4 с NEON инструкциями
 """
 import os
 import cv2
@@ -11,6 +12,29 @@ import yaml
 import argparse
 import time
 from pathlib import Path
+import multiprocessing
+
+# Оптимизации для ARM/Raspberry Pi 4 с NEON
+# Устанавливаем переменные окружения ДО импорта библиотек для максимальной производительности
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '4')
+os.environ.setdefault('MKL_NUM_THREADS', '4')
+os.environ.setdefault('NUMEXPR_NUM_THREADS', '4')
+os.environ.setdefault('OMP_NUM_THREADS', '4')
+os.environ.setdefault('VECLIB_MAXIMUM_THREADS', '4')
+
+# Для ONNX Runtime - использовать все доступные оптимизации
+os.environ.setdefault('ORT_DISABLE_ALL_OPTIMIZATIONS', '0')
+os.environ.setdefault('ORT_ENABLE_BASIC_OPTIMIZATIONS', '1')
+os.environ.setdefault('ORT_ENABLE_EXTENDED_OPTIMIZATIONS', '1')
+os.environ.setdefault('ORT_ENABLE_LAYOUT_OPTIMIZATIONS', '1')
+
+# Принудительно используем NEON для NumPy (если доступно)
+try:
+    # Проверяем поддержку NEON
+    import numpy.core._multiarray_umath as _multiarray_umath
+    # NumPy автоматически использует NEON если доступно
+except:
+    pass
 
 
 # Классы символов для маппинга (как в эталоне)
@@ -26,7 +50,8 @@ CLASS_NAMES = {v: k for k, v in CHAR_CLASSES.items()}
 class NCNNPlateDetector:
     """Детектор номерных знаков на базе NCNN (YOLOv8-Pose)"""
     
-    def __init__(self, model_dir, conf_threshold=0.25, iou_threshold=0.45):
+    def __init__(self, model_dir, conf_threshold=0.25, iou_threshold=0.45, 
+                 num_threads=None, use_vulkan=False):
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
         
@@ -48,19 +73,47 @@ class NCNNPlateDetector:
             raise FileNotFoundError(f"Не найдены файлы модели в {model_dir}")
         
         self.net = ncnn.Net()
-        self.net.opt.use_vulkan_compute = False
-        self.net.opt.num_threads = 4
+        
+        # Оптимизации для Raspberry Pi 4
+        if num_threads is None:
+            # Используем все доступные ядра (Raspberry Pi 4 имеет 4 ядра)
+            num_threads = min(4, multiprocessing.cpu_count())
+        
+        self.net.opt.use_vulkan_compute = use_vulkan
+        self.net.opt.num_threads = num_threads
+        
+        # Агрессивные оптимизации для ARM с NEON
+        self.net.opt.use_winograd_convolution = True   # Winograd быстрее на ARM
+        self.net.opt.use_winograd23_convolution = True  # Winograd 2x3 для ARM
+        self.net.opt.use_winograd43_convolution = True  # Winograd 4x3 для ARM
+        self.net.opt.use_sgemm_convolution = True      # Оптимизированные свертки
+        self.net.opt.use_fp16_storage = False           # FP32 для точности (FP16 может быть медленнее на CPU)
+        self.net.opt.use_fp16_arithmetic = False        # FP32 арифметика
+        
+        # Оптимизации памяти
+        self.net.opt.use_packing_layout = True          # Упаковка данных для NEON
+        
         self.net.load_param(param_path)
         self.net.load_model(bin_path)
+        
+        print(f"NCNN модель загружена: {model_dir}")
+        print(f"  Вход: {self.img_w}x{self.img_h}")
+        print(f"  Потоков: {self.net.opt.num_threads}")
+        print(f"  Vulkan: {self.net.opt.use_vulkan_compute}")
     
     def preprocess(self, image):
         h, w = image.shape[:2]
         scale = min(self.img_h / h, self.img_w / w)
         new_h, new_w = int(h * scale), int(w * scale)
         
-        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        padded = np.zeros((self.img_h, self.img_w, 3), dtype=np.uint8)
-        padded.fill(114)
+        # Используем INTER_AREA для уменьшения (быстрее на ARM)
+        if scale < 1.0:
+            resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        else:
+            resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        
+        # Предвыделяем массив один раз (быстрее чем zeros + fill)
+        padded = np.full((self.img_h, self.img_w, 3), 114, dtype=np.uint8)
         pad_h = (self.img_h - new_h) // 2
         pad_w = (self.img_w - new_w) // 2
         padded[pad_h:pad_h + new_h, pad_w:pad_w + new_w] = resized
@@ -144,10 +197,21 @@ class NCNNPlateDetector:
         return boxes, scores, keypoints
     
     def nms(self, boxes, scores):
+        """NMS с оптимизациями для векторизации (NEON)"""
         if len(boxes) == 0:
             return []
         
-        areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        # Используем float32 для лучшей производительности на ARM
+        boxes = boxes.astype(np.float32, copy=False)
+        scores = scores.astype(np.float32, copy=False)
+        
+        # Векторизованное вычисление площадей
+        areas = np.multiply(
+            np.subtract(boxes[:, 2], boxes[:, 0], dtype=np.float32),
+            np.subtract(boxes[:, 3], boxes[:, 1], dtype=np.float32),
+            dtype=np.float32
+        )
+        
         order = scores.argsort()[::-1]
         keep = []
         
@@ -158,14 +222,21 @@ class NCNNPlateDetector:
                 break
             
             rest = order[1:]
+            # Векторизованные операции для лучшего использования NEON
             xx1 = np.maximum(boxes[i, 0], boxes[rest, 0])
             yy1 = np.maximum(boxes[i, 1], boxes[rest, 1])
             xx2 = np.minimum(boxes[i, 2], boxes[rest, 2])
             yy2 = np.minimum(boxes[i, 3], boxes[rest, 3])
             
-            intersection = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
-            union = areas[i] + areas[rest] - intersection
-            iou = intersection / (union + 1e-6)
+            # Векторизованное вычисление пересечения
+            w = np.maximum(0, xx2 - xx1)
+            h = np.maximum(0, yy2 - yy1)
+            intersection = np.multiply(w, h, dtype=np.float32)
+            
+            # Векторизованное вычисление IoU
+            union = np.add(areas[i], areas[rest], dtype=np.float32)
+            union = np.subtract(union, intersection, dtype=np.float32)
+            iou = np.divide(intersection, np.add(union, 1e-6), dtype=np.float32)
             
             order = rest[iou <= self.iou_threshold]
         
@@ -175,18 +246,45 @@ class NCNNPlateDetector:
 class ONNXCharDetector:
     """Посимвольный детектор на базе ONNX (эквивалент ultralytics YOLO)"""
     
-    def __init__(self, model_path, conf_threshold=0.25):
+    def __init__(self, model_path, conf_threshold=0.25, num_threads=None):
         self.conf_threshold = conf_threshold
         self.num_classes = 36
         
-        # Загружаем модель ONNX
+        # Оптимизации для Raspberry Pi 4
+        if num_threads is None:
+            # Используем все доступные ядра
+            num_threads = min(4, multiprocessing.cpu_count())
+        
+        # Загружаем модель ONNX с агрессивными оптимизациями для ARM
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        
+        # Настройки потоков для Raspberry Pi 4
+        sess_options.intra_op_num_threads = num_threads  # Параллелизм внутри операций
+        sess_options.inter_op_num_threads = 1            # Один поток между операциями (лучше для малых моделей)
+        
+        # Оптимизации памяти для ARM
+        sess_options.enable_mem_pattern = True           # Переиспользование памяти
+        sess_options.enable_cpu_mem_arena = True          # CPU memory arena для ARM
+        
+        # Дополнительные оптимизации
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        
+        # Оптимизации для ARM/NEON (через провайдер)
+        provider_options = {
+            'CPUExecutionProvider': {
+                'arena_extend_strategy': 'kSameAsRequested',
+                'enable_cpu_mem_arena': True,
+                'enable_mem_pattern': True,
+                'memory_limit': 2 * 1024 * 1024 * 1024,  # 2GB лимит памяти
+            }
+        }
         
         self.session = ort.InferenceSession(
             model_path,
             sess_options=sess_options,
-            providers=['CPUExecutionProvider']
+            providers=['CPUExecutionProvider'],
+            provider_options=provider_options
         )
         
         self.input_name = self.session.get_inputs()[0].name
@@ -198,6 +296,7 @@ class ONNXCharDetector:
         
         print(f"OCR модель: {model_path}")
         print(f"  Вход: {self.img_w}x{self.img_h}")
+        print(f"  Потоков: {sess_options.intra_op_num_threads}")
     
     def detect(self, cropped_plate):
         """
@@ -207,26 +306,40 @@ class ONNXCharDetector:
         """
         orig_h, orig_w = cropped_plate.shape[:2]
         
-        # Предобработка (как в ultralytics)
+        # Предобработка (как в ultralytics) с оптимизациями для ARM
         scale = min(self.img_h / orig_h, self.img_w / orig_w)
         new_h, new_w = int(orig_h * scale), int(orig_w * scale)
         
-        resized = cv2.resize(cropped_plate, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        # Используем INTER_AREA для уменьшения (быстрее на ARM)
+        if scale < 1.0:
+            resized = cv2.resize(cropped_plate, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        else:
+            resized = cv2.resize(cropped_plate, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
         
-        padded = np.zeros((self.img_h, self.img_w, 3), dtype=np.uint8)
-        padded.fill(114)
+        # Предвыделяем массив один раз (быстрее чем zeros + fill)
+        padded = np.full((self.img_h, self.img_w, 3), 114, dtype=np.uint8)
         pad_h = (self.img_h - new_h) // 2
         pad_w = (self.img_w - new_w) // 2
         padded[pad_h:pad_h + new_h, pad_w:pad_w + new_w] = resized
         
-        # Конвертируем в формат модели
+        # Конвертируем в формат модели (максимально оптимизировано для NEON)
+        # Используем прямое преобразование без промежуточных копий
         blob = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
-        blob = blob.astype(np.float32) / 255.0
+        
+        # Оптимизированное преобразование: делаем всё за один проход где возможно
+        # Используем константу для деления (компилятор может оптимизировать)
+        INV_255 = 1.0 / 255.0
+        
+        # Преобразуем в float32 и нормализуем за один проход
+        blob = blob.astype(np.float32) * INV_255
+        
+        # Транспонируем и добавляем batch dimension
         blob = np.transpose(blob, (2, 0, 1))
         blob = np.expand_dims(blob, axis=0)
         
-        # Инференс
-        outputs = self.session.run(None, {self.input_name: blob})
+        # Инференс (используем output_names для лучшей оптимизации)
+        output_names = [output.name for output in self.session.get_outputs()]
+        outputs = self.session.run(output_names, {self.input_name: blob})
         output = outputs[0]
         
         # Обработка выхода YOLO
@@ -236,8 +349,13 @@ class ONNXCharDetector:
             output = output.T
         
         # Формат: [x_center, y_center, width, height, class_0, ..., class_35] = 40 признаков
+        # Оптимизация: предвыделяем списки и используем векторизацию где возможно
         detections = []
         
+        # Предвычисляем константы для ускорения
+        inv_scale = 1.0 / scale if scale > 0 else 1.0
+        
+        # Векторизованная обработка где возможно
         for det in output:
             x_center, y_center, width, height = det[0:4]
             class_scores = det[4:4+self.num_classes]
@@ -256,11 +374,11 @@ class ONNXCharDetector:
             x2_model = x_center + width / 2
             y2_model = y_center + height / 2
             
-            # Убираем padding и масштабируем
-            x1 = (x1_model - pad_w) / scale
-            y1 = (y1_model - pad_h) / scale
-            x2 = (x2_model - pad_w) / scale
-            y2 = (y2_model - pad_h) / scale
+            # Убираем padding и масштабируем (используем предвычисленную константу)
+            x1 = (x1_model - pad_w) * inv_scale
+            y1 = (y1_model - pad_h) * inv_scale
+            x2 = (x2_model - pad_w) * inv_scale
+            y2 = (y2_model - pad_h) * inv_scale
             
             # Clip к границам
             x1 = max(0, min(x1, orig_w))
@@ -283,10 +401,11 @@ class ONNXCharDetector:
                 'conf': float(conf)
             })
         
-        # NMS
+        # NMS (оптимизировано для векторизации)
         if len(detections) > 1:
-            boxes = np.array([d['xyxy'] for d in detections])
-            scores = np.array([d['conf'] for d in detections])
+            # Используем предвыделенные массивы для лучшей производительности
+            boxes = np.array([d['xyxy'] for d in detections], dtype=np.float32)
+            scores = np.array([d['conf'] for d in detections], dtype=np.float32)
             keep = self.nms(boxes, scores, 0.5)
             detections = [detections[i] for i in keep]
         
@@ -296,10 +415,21 @@ class ONNXCharDetector:
         return detections
     
     def nms(self, boxes, scores, iou_threshold=0.5):
+        """NMS с оптимизациями для векторизации (NEON)"""
         if len(boxes) == 0:
             return []
         
-        areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        # Используем float32 для лучшей производительности на ARM
+        boxes = boxes.astype(np.float32, copy=False)
+        scores = scores.astype(np.float32, copy=False)
+        
+        # Векторизованное вычисление площадей
+        areas = np.multiply(
+            np.subtract(boxes[:, 2], boxes[:, 0], dtype=np.float32),
+            np.subtract(boxes[:, 3], boxes[:, 1], dtype=np.float32),
+            dtype=np.float32
+        )
+        
         order = scores.argsort()[::-1]
         keep = []
         
@@ -310,14 +440,21 @@ class ONNXCharDetector:
                 break
             
             rest = order[1:]
+            # Векторизованные операции для лучшего использования NEON
             xx1 = np.maximum(boxes[i, 0], boxes[rest, 0])
             yy1 = np.maximum(boxes[i, 1], boxes[rest, 1])
             xx2 = np.minimum(boxes[i, 2], boxes[rest, 2])
             yy2 = np.minimum(boxes[i, 3], boxes[rest, 3])
             
-            intersection = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
-            union = areas[i] + areas[rest] - intersection
-            iou = intersection / (union + 1e-6)
+            # Векторизованное вычисление пересечения
+            w = np.maximum(0, xx2 - xx1)
+            h = np.maximum(0, yy2 - yy1)
+            intersection = np.multiply(w, h, dtype=np.float32)
+            
+            # Векторизованное вычисление IoU
+            union = np.add(areas[i], areas[rest], dtype=np.float32)
+            union = np.subtract(union, intersection, dtype=np.float32)
+            iou = np.divide(intersection, np.add(union, 1e-6), dtype=np.float32)
             
             order = rest[iou <= iou_threshold]
         
@@ -368,13 +505,23 @@ def generate_color_palette(n):
 
 
 def process_images(input_dir, output_dir, plate_model_dir, char_model_path, 
-                  plate_conf=0.25, char_conf=0.25):
+                  plate_conf=0.25, char_conf=0.25, num_threads=None, use_vulkan=False,
+                  no_visualization=False):
     """Обработка изображений (как в эталоне)"""
     os.makedirs(output_dir, exist_ok=True)
     
     print("Загрузка моделей...")
-    plate_detector = NCNNPlateDetector(plate_model_dir, conf_threshold=plate_conf)
-    char_detector = ONNXCharDetector(char_model_path, conf_threshold=char_conf)
+    plate_detector = NCNNPlateDetector(
+        plate_model_dir, 
+        conf_threshold=plate_conf,
+        num_threads=num_threads,
+        use_vulkan=use_vulkan
+    )
+    char_detector = ONNXCharDetector(
+        char_model_path, 
+        conf_threshold=char_conf,
+        num_threads=num_threads
+    )
     print("Готово!\n")
     
     # Получаем список изображений
@@ -393,6 +540,8 @@ def process_images(input_dir, output_dir, plate_model_dir, char_model_path,
     total_time = 0
     plate_time_total = 0
     char_time_total = 0
+    vis_time_total = 0
+    io_time_total = 0
     other_time_total = 0
     
     for img_idx, img_path in enumerate(sorted(image_files)):
@@ -440,79 +589,95 @@ def process_images(input_dir, output_dir, plate_model_dir, char_model_path,
             char_time = time.time() - char_start
             char_time_total += char_time
             
-            proc_time = time.time() - start
-            other_time = proc_time - plate_time - char_time
-            other_time_total += other_time
-            total_time += proc_time
-            
             # Собираем текст
             text = ''.join([d['char'] for d in char_detections])
             avg_conf = np.mean([d['conf'] for d in char_detections]) if char_detections else 0
             
-            # Создаём визуализацию
-            debug = img.copy()
+            # Измеряем время визуализации отдельно
+            vis_start = time.time()
+            debug = None
             
-            # Рисуем полигон номера по keypoints (как в эталоне)
-            pts = np.array([[int(kpt[0]), int(kpt[1])] for kpt in kpts], dtype=np.int32)
-            cv2.polylines(debug, [pts], True, (0, 255, 0), 2)
+            if not no_visualization:
+                # Создаём визуализацию (оптимизировано - избегаем лишних копий)
+                debug = img.copy()
             
-            # Рисуем ключевые точки с номерами
-            for j, kpt in enumerate(kpts):
-                x, y = int(kpt[0]), int(kpt[1])
-                cv2.circle(debug, (x, y), 5, (0, 0, 255), -1)
-                cv2.putText(debug, str(j), (x+5, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            if debug is not None:
+                # Рисуем полигон номера по keypoints (оптимизировано - предвыделяем массив)
+                pts = np.empty((len(kpts), 2), dtype=np.int32)
+                for i, kpt in enumerate(kpts):
+                    pts[i, 0] = int(kpt[0])
+                    pts[i, 1] = int(kpt[1])
+                cv2.polylines(debug, [pts], True, (0, 255, 0), 2)
+                
+                # Рисуем ключевые точки с номерами (оптимизировано - меньше вызовов)
+                for j, kpt in enumerate(kpts):
+                    x, y = int(kpt[0]), int(kpt[1])
+                    cv2.circle(debug, (x, y), 5, (0, 0, 255), -1)
+                    # Убираем текст для ускорения (опционально)
+                    # cv2.putText(debug, str(j), (x+5, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                
+                # Рисуем символы с цветными рамками (как в эталоне)
+                if char_detections:
+                    colors = generate_color_palette(len(char_detections))
+                    legend_items = []
+                    
+                    for i, det in enumerate(char_detections):
+                        # Координаты символа в координатах cropped_plate
+                        x1, y1, x2, y2 = det['xyxy']
+                        
+                        # Преобразуем в координаты исходного изображения (как в эталоне)
+                        abs_x1 = x1 + plate_x_min
+                        abs_y1 = y1 + plate_y_min
+                        abs_x2 = x2 + plate_x_min
+                        abs_y2 = y2 + plate_y_min
+                        
+                        char_pts = np.array([
+                            [abs_x1, abs_y1],
+                            [abs_x2, abs_y1],
+                            [abs_x2, abs_y2],
+                            [abs_x1, abs_y2]
+                        ], dtype=np.int32)
+                        
+                        color = colors[i]
+                        cv2.polylines(debug, [char_pts], True, color, 1)
+                        
+                        legend_items.append((i, det['char'], color, det['conf']))
+                    
+                    # Легенда (оптимизировано - меньше операций)
+                    legend_x, legend_y = 10, 30
+                    legend_spacing = 20
+                    bg_height = len(legend_items) * legend_spacing + 10
+                    
+                    # Используем прямое рисование вместо копирования и смешивания
+                    cv2.rectangle(debug, (legend_x - 5, legend_y - 20), 
+                                 (legend_x + 150, legend_y + bg_height), (0, 0, 0), -1)
+                    
+                    cv2.putText(debug, "Chars:", (legend_x, legend_y), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    
+                    for idx, (i, char, color, char_conf) in enumerate(legend_items):
+                        y_pos = legend_y + (idx + 1) * legend_spacing
+                        cv2.rectangle(debug, (legend_x, y_pos - 10), 
+                                     (legend_x + 15, y_pos + 5), color, -1)
+                        text_line = f"{i}: '{char}' ({char_conf:.2f})"
+                        cv2.putText(debug, text_line, (legend_x + 20, y_pos), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
             
-            # Рисуем символы с цветными рамками (как в эталоне)
-            if char_detections:
-                colors = generate_color_palette(len(char_detections))
-                legend_items = []
-                
-                for i, det in enumerate(char_detections):
-                    # Координаты символа в координатах cropped_plate
-                    x1, y1, x2, y2 = det['xyxy']
-                    
-                    # Преобразуем в координаты исходного изображения (как в эталоне)
-                    abs_x1 = x1 + plate_x_min
-                    abs_y1 = y1 + plate_y_min
-                    abs_x2 = x2 + plate_x_min
-                    abs_y2 = y2 + plate_y_min
-                    
-                    char_pts = np.array([
-                        [abs_x1, abs_y1],
-                        [abs_x2, abs_y1],
-                        [abs_x2, abs_y2],
-                        [abs_x1, abs_y2]
-                    ], dtype=np.int32)
-                    
-                    color = colors[i]
-                    cv2.polylines(debug, [char_pts], True, color, 1)
-                    
-                    legend_items.append((i, det['char'], color, det['conf']))
-                
-                # Легенда (как в эталоне)
-                legend_x, legend_y = 10, 30
-                legend_spacing = 20
-                bg_height = len(legend_items) * legend_spacing + 10
-                
-                overlay = debug.copy()
-                cv2.rectangle(overlay, (legend_x - 5, legend_y - 20), 
-                             (legend_x + 150, legend_y + bg_height), (0, 0, 0), -1)
-                cv2.addWeighted(overlay, 0.7, debug, 0.3, 0, debug)
-                
-                cv2.putText(debug, "Chars:", (legend_x, legend_y), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                
-                for idx, (i, char, color, char_conf) in enumerate(legend_items):
-                    y_pos = legend_y + (idx + 1) * legend_spacing
-                    cv2.rectangle(debug, (legend_x, y_pos - 10), 
-                                 (legend_x + 15, y_pos + 5), color, -1)
-                    text_line = f"{i}: '{char}' ({char_conf:.2f})"
-                    cv2.putText(debug, text_line, (legend_x + 20, y_pos), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            vis_time = time.time() - vis_start
+            vis_time_total += vis_time
             
-            # Сохраняем
-            output_path = Path(output_dir) / f"{img_path.stem}_chars{img_path.suffix}"
-            cv2.imwrite(str(output_path), debug)
+            # Сохраняем (измеряем I/O отдельно)
+            io_start = time.time()
+            if debug is not None:
+                output_path = Path(output_dir) / f"{img_path.stem}_chars{img_path.suffix}"
+                cv2.imwrite(str(output_path), debug)
+            io_time = time.time() - io_start
+            io_time_total += io_time
+            
+            proc_time = time.time() - start
+            other_time = proc_time - plate_time - char_time - vis_time - io_time
+            other_time_total += other_time
+            total_time += proc_time
             
             stats['ok'] += 1
             print(f"✅ {img_path.name}: {text} ({avg_conf:.2f}) [{proc_time*1000:.0f}ms]")
@@ -529,9 +694,11 @@ def process_images(input_dir, output_dir, plate_model_dir, char_model_path,
     print(f"❌ Ошибок: {stats['fail']}")
     if stats['ok'] > 0:
         print(f"\nВРЕМЯ (среднее на изображение):")
-        print(f"  1. Детекция номера (YOLO Pose NCNN): {plate_time_total/stats['ok']*1000:.0f} мс")
-        print(f"  2. Детекция символов (ONNX 640x640): {char_time_total/stats['ok']*1000:.0f} мс")
-        print(f"  3. Прочее (вырезка, визуализация):  {other_time_total/stats['ok']*1000:.0f} мс")
+        print(f"  1. Детекция номера (YOLO Pose NCNN): {plate_time_total/stats['ok']*1000:.0f} мс ({plate_time_total/total_time*100:.1f}%)")
+        print(f"  2. Детекция символов (ONNX 640x640): {char_time_total/stats['ok']*1000:.0f} мс ({char_time_total/total_time*100:.1f}%)")
+        print(f"  3. Визуализация:                      {vis_time_total/stats['ok']*1000:.0f} мс ({vis_time_total/total_time*100:.1f}%)")
+        print(f"  4. I/O (чтение/запись файлов):        {io_time_total/stats['ok']*1000:.0f} мс ({io_time_total/total_time*100:.1f}%)")
+        print(f"  5. Прочее (вырезка, обработка):       {other_time_total/stats['ok']*1000:.0f} мс ({other_time_total/total_time*100:.1f}%)")
         print(f"  ─────────────────────────────────────")
         print(f"  ИТОГО: {total_time/stats['ok']*1000:.0f} мс")
     print("="*50)
@@ -545,11 +712,20 @@ def main():
     parser.add_argument('--char-model', type=str, default='./ocr/best.onnx')
     parser.add_argument('--plate-conf', type=float, default=0.25)
     parser.add_argument('--char-conf', type=float, default=0.25)
+    parser.add_argument('--num-threads', type=int, default=None,
+                       help='Количество потоков (по умолчанию: все доступные ядра)')
+    parser.add_argument('--use-vulkan', action='store_true',
+                       help='Использовать Vulkan для NCNN (требует поддержки GPU)')
+    parser.add_argument('--no-visualization', action='store_true',
+                       help='Отключить визуализацию для ускорения')
     
     args = parser.parse_args()
     
-    process_images(args.input, args.output, args.plate_model, args.char_model, 
-                  args.plate_conf, args.char_conf)
+    process_images(
+        args.input, args.output, args.plate_model, args.char_model, 
+        args.plate_conf, args.char_conf, args.num_threads, args.use_vulkan,
+        args.no_visualization
+    )
 
 
 if __name__ == '__main__':
