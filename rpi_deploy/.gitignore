@@ -5,10 +5,9 @@ __pycache__/
 *.so
 .Python
 *.egg-info/
-dist/
-build/
 
 # Virtual Environment
+.venv/
 venv/
 env/
 ENV/
@@ -23,13 +22,9 @@ ENV/
 *.webp
 
 # Input/Output directories
-input_images/
-output_chars/
-output_*/
+input/
 output/
-debug_*/
-
-# Benchmark results
+output_*/
 output_onnx_bench/
 output_ncnn_bench/
 output_onnx/
@@ -39,9 +34,9 @@ output_ncnn/
 *.onnx
 *.bin
 *.param
-*.pt
-*.pth
-*.weights
+*.ncnn.param
+*.ncnn.bin
+model_ncnn/
 
 # IDE
 .vscode/
@@ -61,7 +56,4 @@ Thumbs.db
 *.tmp
 *.bak
 *.cache
-
-# GitHub token (локальный файл, не коммитить!)
-.github_token
 
